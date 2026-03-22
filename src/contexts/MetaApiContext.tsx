@@ -95,6 +95,12 @@ interface TickData {
   time: string;
 }
 
+interface TradeExecutionResponse {
+  error?: string;
+  warning?: string;
+  stopsApplied?: boolean;
+}
+
 interface Candle {
   time: string;
   open: number;
@@ -483,33 +489,68 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
     window.setTimeout(() => notification.close(), 8000);
   }, []);
 
-  // Convert pips to actual price levels using current tick
+  const getLatestTick = useCallback(async (symbol: string): Promise<TickData | null> => {
+    const existing = ticks[symbol];
+    if (existing && Number.isFinite(existing.bid) && Number.isFinite(existing.ask)) {
+      return existing;
+    }
+
+    const connId = connectionIdRef.current;
+    if (!connId) return null;
+
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke("mt5-proxy", {
+        body: { action: "tick", connectionId: connId, symbol },
+      });
+
+      if (fnError || !data) return null;
+
+      const fetchedTick: TickData = {
+        symbol,
+        bid: toNumber(data.bid),
+        ask: toNumber(data.ask),
+        time: data.time || new Date().toISOString(),
+      };
+
+      if (!fetchedTick.bid && !fetchedTick.ask) return null;
+
+      setTicks((prev) => ({ ...prev, [symbol]: fetchedTick }));
+      return fetchedTick;
+    } catch {
+      return null;
+    }
+  }, [ticks]);
+
+  const countDecimals = useCallback((value: number) => {
+    const text = String(value);
+    if (!text.includes(".")) return 0;
+    return text.split(".")[1]?.length ?? 0;
+  }, []);
+
+  // Convert entered distance values to actual price levels using the latest quote.
   const pipsToPriceLevel = useCallback(
-    (symbol: string, type: string, tpPips?: number, slPips?: number) => {
-      const tick = ticks[symbol];
+    (tick: TickData | null, type: string, tpPips?: number, slPips?: number) => {
       if (!tick) return { tpPrice: undefined, slPrice: undefined };
 
       const isBuy = type.toLowerCase() === "buy";
       const basePrice = isBuy ? tick.ask : tick.bid;
       const pipValue = 1;
+      const precision = Math.max(countDecimals(tick.bid), countDecimals(tick.ask));
+      const roundToPrecision = (value: number) => Number(value.toFixed(precision));
 
       const tpPrice =
         typeof tpPips === "number" && tpPips > 0
-          ? isBuy
-            ? basePrice + tpPips * pipValue
-            : basePrice - tpPips * pipValue
+          ? roundToPrecision(isBuy ? basePrice + tpPips * pipValue : basePrice - tpPips * pipValue)
           : undefined;
 
       const slPrice =
         typeof slPips === "number" && slPips > 0
-          ? isBuy
-            ? basePrice - slPips * pipValue
-            : basePrice + slPips * pipValue
+          ? roundToPrecision(isBuy ? basePrice - slPips * pipValue : basePrice + slPips * pipValue)
           : undefined;
 
       return { tpPrice, slPrice };
     },
-    [ticks]
+    [countDecimals]
   );
 
   const openPosition = useCallback(
@@ -517,7 +558,8 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const connId = connectionIdRef.current;
       if (!connId) throw new Error("Not connected");
 
-      const { tpPrice, slPrice } = pipsToPriceLevel(symbol, type, tpPips, slPips);
+      const latestTick = await getLatestTick(symbol);
+      const { tpPrice, slPrice } = pipsToPriceLevel(latestTick, type, tpPips, slPips);
 
       console.log(`Opening ${type} ${volume} lots on ${symbol} | TP pips: ${tpPips} → price: ${tpPrice} | SL pips: ${slPips} → price: ${slPrice}`);
 
@@ -534,9 +576,15 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       });
       if (fnError) throw fnError;
       if (data?.error) throw new Error(data.error);
+
+      const tradeResponse = data as TradeExecutionResponse | null;
+      if (tradeResponse?.warning) {
+        toast.warning(tradeResponse.warning);
+      }
+
       return data;
     },
-    [pipsToPriceLevel]
+    [getLatestTick, pipsToPriceLevel]
   );
 
   // Open multiple positions with retry and per-trade error reporting
