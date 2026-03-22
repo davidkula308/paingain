@@ -1,0 +1,216 @@
+import { useState } from "react";
+import { useMetaApi } from "@/contexts/MetaApiContext";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { toast } from "sonner";
+import { Checkbox } from "@/components/ui/checkbox";
+
+interface ManualTradePanelProps {
+  selectedSymbol: string | null;
+}
+
+const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
+  const {
+    autoTrade, setAutoTrade, lotSize, setLotSize,
+    autoTradeLotSize, setAutoTradeLotSize,
+    takeProfit, setTakeProfit, stopLoss, setStopLoss,
+    openMultiplePositions, accountInfo, watchList, isConnected,
+    autoTradeSymbols, toggleAutoTradeSymbol,
+  } = useMetaApi();
+  const [numTrades, setNumTrades] = useState(1);
+  const [isTrading, setIsTrading] = useState(false);
+  const [symbol, setSymbol] = useState(selectedSymbol || "");
+
+  const currentSymbol = selectedSymbol || symbol;
+
+  const executeTrades = async (type: "buy" | "sell") => {
+    if (!currentSymbol || !isConnected) {
+      toast.error("Select a symbol and connect first");
+      return;
+    }
+    setIsTrading(true);
+    try {
+      const results = await openMultiplePositions(
+        currentSymbol, type, lotSize, numTrades, takeProfit, stopLoss
+      );
+      const succeeded = results.filter((r) => r.success).length;
+      const failed = results.filter((r) => !r.success);
+
+      if (succeeded > 0) {
+        toast.success(`${succeeded}/${numTrades} ${type.toUpperCase()} trades placed on ${currentSymbol}`);
+      }
+      failed.forEach((r) => {
+        toast.error(`Trade #${r.index} failed: ${r.error || "Insufficient margin"}`);
+      });
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Trade execution failed");
+    } finally {
+      setIsTrading(false);
+    }
+  };
+
+  const maxMarginUsed = accountInfo
+    ? ((accountInfo.margin / (accountInfo.margin + accountInfo.freeMargin)) * 100).toFixed(1)
+    : "0.0";
+
+  return (
+    <div className="p-3 space-y-3 text-sm">
+      {/* Auto Trade Toggle */}
+      <div className="flex items-center justify-between">
+        <Label className="text-xs">Auto-Trade</Label>
+        <Switch checked={autoTrade} onCheckedChange={setAutoTrade} />
+      </div>
+      {autoTrade && (
+        <div className="space-y-2 bg-bearish/10 rounded p-2">
+          <p className="text-[10px] text-bearish font-semibold">
+            BOT ACTIVE — trades until margin exhausted
+          </p>
+
+          {/* Auto-Trade Lot Size */}
+          <div className="space-y-1">
+            <Label className="text-[10px] text-muted-foreground">Auto-Trade Lot Size</Label>
+            <Input
+              type="number"
+              step="0.01"
+              min="0.01"
+              value={autoTradeLotSize || ""}
+              onChange={(e) => {
+                const val = e.target.value;
+                setAutoTradeLotSize(val === "" || val === "0" ? 0 : Number(val));
+              }}
+              onBlur={() => { if (autoTradeLotSize <= 0) setAutoTradeLotSize(0.01); }}
+              className="bg-muted font-mono text-sm h-7"
+            />
+          </div>
+          <p className="text-[10px] text-muted-foreground">
+            Opens trades with this lot until margin is full
+          </p>
+          <p className="text-[10px] text-muted-foreground font-semibold">Auto-Trade Symbols</p>
+          <div className="space-y-1 max-h-32 overflow-auto">
+            {watchList.map((s) => (
+              <label key={s} className="flex items-center gap-1.5 text-[10px] font-mono">
+                <Checkbox
+                  checked={autoTradeSymbols.includes(s)}
+                  onCheckedChange={() => toggleAutoTradeSymbol(s)}
+                  className="h-3 w-3"
+                />
+                {s}
+              </label>
+            ))}
+          </div>
+          <p className="text-[9px] text-muted-foreground">
+            If multiple spikes, trades highest index only
+          </p>
+        </div>
+      )}
+
+      {/* Symbol */}
+      <div className="space-y-1">
+        <Label className="text-xs text-muted-foreground">Symbol</Label>
+        <select
+          value={currentSymbol}
+          onChange={(e) => setSymbol(e.target.value)}
+          className="w-full bg-muted border border-border rounded px-2 py-1.5 text-sm font-mono text-foreground"
+        >
+          <option value="">Select symbol</option>
+          {watchList.map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Lot Size */}
+      <div className="space-y-1">
+        <Label className="text-xs text-muted-foreground">Lot Size</Label>
+        <Input
+          type="number"
+          step="0.01"
+          min="0.01"
+          value={lotSize || ""}
+          onChange={(e) => {
+            const val = e.target.value;
+            if (val === "" || val === "0") {
+              setLotSize(0);
+            } else {
+              setLotSize(Number(val));
+            }
+          }}
+          onBlur={() => { if (lotSize <= 0) setLotSize(0.01); }}
+          className="bg-muted font-mono text-sm h-8"
+        />
+      </div>
+
+      {/* TP / SL in pips */}
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <Label className="text-xs text-muted-foreground">TP (pips)</Label>
+          <Input
+            type="number"
+            value={takeProfit || ""}
+            onChange={(e) => {
+              const val = e.target.value;
+              setTakeProfit(val === "" ? 0 : Number(val));
+            }}
+            onBlur={() => { if (takeProfit < 0) setTakeProfit(0); }}
+            placeholder="5000"
+            className="bg-muted font-mono text-sm h-8"
+          />
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs text-muted-foreground">SL (pips)</Label>
+          <Input
+            type="number"
+            value={stopLoss || ""}
+            onChange={(e) => {
+              const val = e.target.value;
+              setStopLoss(val === "" ? 0 : Number(val));
+            }}
+            onBlur={() => { if (stopLoss < 0) setStopLoss(0); }}
+            placeholder="8000"
+            className="bg-muted font-mono text-sm h-8"
+          />
+        </div>
+      </div>
+
+      {/* Number of Trades */}
+      <div className="space-y-1">
+        <Label className="text-xs text-muted-foreground">Number of Trades</Label>
+        <Input
+          type="number"
+          min="1"
+          value={numTrades}
+          onChange={(e) => setNumTrades(Number(e.target.value) || 1)}
+          className="bg-muted font-mono text-sm h-8"
+        />
+      </div>
+
+      {/* Max Margin */}
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-muted-foreground">Margin Used</span>
+        <span className="font-mono">{maxMarginUsed}%</span>
+      </div>
+
+      {/* Buy / Sell */}
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          onClick={() => executeTrades("buy")}
+          disabled={isTrading || !currentSymbol || !isConnected}
+          className="bg-bullish hover:bg-bullish/90 text-bullish-foreground font-semibold h-10"
+        >
+          {isTrading ? "..." : "BUY"}
+        </Button>
+        <Button
+          onClick={() => executeTrades("sell")}
+          disabled={isTrading || !currentSymbol || !isConnected}
+          className="bg-bearish hover:bg-bearish/90 text-bearish-foreground font-semibold h-10"
+        >
+          {isTrading ? "..." : "SELL"}
+        </Button>
+      </div>
+    </div>
+  );
+};
+
+export default ManualTradePanel;

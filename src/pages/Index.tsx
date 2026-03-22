@@ -1,16 +1,28 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { useState } from "react";
+import AppSidebar from "@/components/AppSidebar";
+import AccountHeader from "@/components/AccountHeader";
+import HomeTab from "@/components/HomeTab";
+import AccountTab from "@/components/AccountTab";
+import TradeTab from "@/components/TradeTab";
 
-// IMPORTANT: Fully REPLACE this with your own code
-const PlaceholderIndex = () => {
-  // PLACEHOLDER: Replace this entire return statement with the user's app.
-  // The inline background color is intentionally not part of the design system.
+type Tab = "home" | "account" | "trade";
+
+const Index = () => {
+  const [activeTab, setActiveTab] = useState<Tab>("account");
+
   return (
-    <div className="flex min-h-screen items-center justify-center" style={{ backgroundColor: '#fcfbf8' }}>
-      <img data-lovable-blank-page-placeholder="REMOVE_THIS" src="/placeholder.svg" alt="Your app will live here!" />
+    <div className="flex h-screen overflow-hidden bg-background text-foreground">
+      <AppSidebar activeTab={activeTab} onTabChange={setActiveTab} />
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <AccountHeader />
+        <div className="flex-1 overflow-auto">
+          {activeTab === "home" && <HomeTab />}
+          {activeTab === "account" && <AccountTab />}
+          {activeTab === "trade" && <TradeTab />}
+        </div>
+      </div>
     </div>
   );
 };
-
-const Index = PlaceholderIndex;
 
 export default Index;
