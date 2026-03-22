@@ -17,7 +17,7 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
     autoTradeLotSize, setAutoTradeLotSize,
     takeProfit, setTakeProfit, stopLoss, setStopLoss,
     openMultiplePositions, accountInfo, watchList, isConnected,
-    autoTradeSymbols, toggleAutoTradeSymbol,
+    autoTradeSymbols, autoTradeExcludedSymbols, toggleAutoTradeSymbol, toggleAutoTradeExclusion,
   } = useMetaApi();
   const [numTrades, setNumTrades] = useState(1);
   const [isTrading, setIsTrading] = useState(false);
@@ -90,18 +90,27 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
           <p className="text-[10px] text-muted-foreground font-semibold">Auto-Trade Symbols</p>
           <div className="space-y-1 max-h-32 overflow-auto">
             {watchList.map((s) => (
-              <label key={s} className="flex items-center gap-1.5 text-[10px] font-mono">
-                <Checkbox
-                  checked={autoTradeSymbols.includes(s)}
-                  onCheckedChange={() => toggleAutoTradeSymbol(s)}
-                  className="h-3 w-3"
-                />
-                {s}
-              </label>
+              <div key={s} className="grid grid-cols-[1fr_auto] items-center gap-2 text-[10px] font-mono">
+                <label className="flex items-center gap-1.5">
+                  <Checkbox
+                    checked={autoTradeSymbols.includes(s)}
+                    onCheckedChange={() => toggleAutoTradeSymbol(s)}
+                    className="h-3 w-3"
+                  />
+                  <span className={autoTradeExcludedSymbols.includes(s) ? "text-muted-foreground line-through" : ""}>{s}</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => toggleAutoTradeExclusion(s)}
+                  className={`rounded border px-1.5 py-0.5 text-[9px] transition-colors ${autoTradeExcludedSymbols.includes(s) ? "border-bearish/40 bg-bearish/15 text-bearish" : "border-border bg-muted text-muted-foreground hover:text-foreground"}`}
+                >
+                  {autoTradeExcludedSymbols.includes(s) ? "Excluded" : "Allow"}
+                </button>
+              </div>
             ))}
           </div>
           <p className="text-[9px] text-muted-foreground">
-            If multiple spikes, trades highest index only
+            Excluded symbols stay visible but are never auto-traded; if multiple spikes, trades highest eligible index only
           </p>
         </div>
       )}

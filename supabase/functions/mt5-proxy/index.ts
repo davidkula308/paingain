@@ -146,6 +146,30 @@ async function applyStopsToOpenedOrder(
   return parseApiResponse(response);
 }
 
+async function waitForOpenedOrder(
+  connectionId: string,
+  symbol: string,
+  operation: "Buy" | "Sell",
+  volume: number,
+  openedTicket?: number
+): Promise<OpenOrderSnapshot | null> {
+  const attempts = 8;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (openedTicket) {
+      const byTicket = await getOpenedOrderByTicket(connectionId, openedTicket);
+      if (byTicket) return byTicket;
+    }
+
+    const latestMatch = await findLatestOpenedOrder(connectionId, symbol, operation, volume);
+    if (latestMatch) return latestMatch;
+
+    await new Promise((resolve) => setTimeout(resolve, 500 + attempt * 250));
+  }
+
+  return null;
+}
+
 // Map timeframe strings to MT5 integer values
 function timeframeToInt(tf: string): number {
   const map: Record<string, number> = {
@@ -310,16 +334,8 @@ serve(async (req) => {
         : { result: openedOrderResult };
 
       if (hasStops) {
-        let orderSnapshot: OpenOrderSnapshot | null = null;
         const openedTicket = extractTicket(openedOrderResult);
-
-        if (openedTicket) {
-          orderSnapshot = await getOpenedOrderByTicket(connectionId, openedTicket);
-        }
-
-        if (!orderSnapshot) {
-          orderSnapshot = await findLatestOpenedOrder(connectionId, symbol, operation, numericVolume);
-        }
+        const orderSnapshot = await waitForOpenedOrder(connectionId, symbol, operation, numericVolume, openedTicket);
 
         if (orderSnapshot) {
           try {

@@ -6,6 +6,8 @@ const toNumber = (v: unknown) => Number(v) || 0;
 
 const STORAGE_KEY = "mt5_credentials";
 const WATCHLIST_KEY = "mt5_watchlist";
+const AUTO_TRADE_ENABLED_KEY = "mt5_auto_trade_enabled_symbols";
+const AUTO_TRADE_EXCLUDED_KEY = "mt5_auto_trade_excluded_symbols";
 const SPIKE_TIMEFRAME = "1m";
 const SPIKE_SCAN_INTERVAL_MS = 5000;
 const MAX_STORED_SPIKES = 200;
@@ -76,6 +78,21 @@ function saveWatchList(list: string[]) {
   localStorage.setItem(WATCHLIST_KEY, JSON.stringify(list));
 }
 
+function loadStoredList(key: string): string[] {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredList(key: string, list: string[]) {
+  localStorage.setItem(key, JSON.stringify(list));
+}
+
 interface AccountInfo {
   balance: number;
   equity: number;
@@ -136,6 +153,7 @@ interface MetaApiContextType {
   spikes: SpikeEvent[];
   autoTrade: boolean;
   autoTradeSymbols: string[];
+  autoTradeExcludedSymbols: string[];
   lotSize: number;
   autoTradeLotSize: number;
   takeProfit: number;
@@ -154,6 +172,7 @@ interface MetaApiContextType {
   setAutoTrade: (v: boolean) => void;
   setAutoTradeSymbols: (v: string[]) => void;
   toggleAutoTradeSymbol: (symbol: string) => void;
+  toggleAutoTradeExclusion: (symbol: string) => void;
   setLotSize: (v: number) => void;
   setAutoTradeLotSize: (v: number) => void;
   setTakeProfit: (v: number) => void;
@@ -183,6 +202,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [spikes, setSpikes] = useState<SpikeEvent[]>([]);
   const [autoTrade, setAutoTrade] = useState(false);
   const [autoTradeSymbols, setAutoTradeSymbols] = useState<string[]>([]);
+  const [autoTradeExcludedSymbols, setAutoTradeExcludedSymbols] = useState<string[]>(() => loadStoredList(AUTO_TRADE_EXCLUDED_KEY));
   const [lotSize, setLotSize] = useState(0.5);
   const [autoTradeLotSize, setAutoTradeLotSize] = useState(0.5);
   const [takeProfit, setTakeProfit] = useState(5000);
@@ -268,8 +288,13 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       }
 
       setAutoTradeSymbols((prev) => {
-        const validPrev = prev.filter((s) => allSyms.includes(s));
-        return validPrev.length > 0 ? validPrev : fallbackWatch;
+        const stored = prev.length > 0 ? prev : loadStoredList(AUTO_TRADE_ENABLED_KEY);
+        const validStored = stored.filter((s) => allSyms.includes(s));
+        return validStored.length > 0 ? validStored : fallbackWatch;
+      });
+      setAutoTradeExcludedSymbols((prev) => {
+        const stored = prev.length > 0 ? prev : loadStoredList(AUTO_TRADE_EXCLUDED_KEY);
+        return stored.filter((s) => allSyms.includes(s));
       });
     } catch (err: unknown) {
       console.error("Failed to fetch symbols:", err);
@@ -282,6 +307,14 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       saveWatchList(watchList);
     }
   }, [watchList]);
+
+  useEffect(() => {
+    saveStoredList(AUTO_TRADE_ENABLED_KEY, autoTradeSymbols);
+  }, [autoTradeSymbols]);
+
+  useEffect(() => {
+    saveStoredList(AUTO_TRADE_EXCLUDED_KEY, autoTradeExcludedSymbols);
+  }, [autoTradeExcludedSymbols]);
 
   // Auto-fetch once when connectionId becomes available
   useEffect(() => {
@@ -377,6 +410,12 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const toggleAutoTradeSymbol = useCallback((symbol: string) => {
     setAutoTradeSymbols((prev) =>
+      prev.includes(symbol) ? prev.filter((s) => s !== symbol) : [...prev, symbol]
+    );
+  }, []);
+
+  const toggleAutoTradeExclusion = useCallback((symbol: string) => {
+    setAutoTradeExcludedSymbols((prev) =>
       prev.includes(symbol) ? prev.filter((s) => s !== symbol) : [...prev, symbol]
     );
   }, []);
@@ -534,8 +573,8 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
       const isBuy = type.toLowerCase() === "buy";
       const basePrice = isBuy ? tick.ask : tick.bid;
-      const pipValue = 1;
       const precision = Math.max(countDecimals(tick.bid), countDecimals(tick.ask));
+      const pipValue = precision > 0 ? 1 / 10 ** precision : 1;
       const roundToPrecision = (value: number) => Number(value.toFixed(precision));
 
       const tpPrice =
@@ -641,7 +680,9 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const detectSpikes = useCallback(async () => {
     if (!isConnected) return;
 
-    const symbolsToScan = (autoTradeSymbols.length > 0 ? autoTradeSymbols : watchList).filter(isSyntheticIndex);
+    const eligibleSymbols = (autoTradeSymbols.length > 0 ? autoTradeSymbols : watchList)
+      .filter((symbol) => !autoTradeExcludedSymbols.includes(symbol));
+    const symbolsToScan = eligibleSymbols.filter(isSyntheticIndex);
     if (!symbolsToScan.length) return;
 
     const candleBatches = await Promise.all(
@@ -720,6 +761,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   }, [
     isConnected,
     autoTradeSymbols,
+    autoTradeExcludedSymbols,
     watchList,
     fetchCandles,
     autoTrade,
@@ -755,12 +797,12 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       value={{
         isConnected, isConnecting, connectionId, accountInfo,
         symbols, syntheticSymbols, watchList, ticks, spikes,
-        autoTrade, autoTradeSymbols, lotSize, autoTradeLotSize,
+        autoTrade, autoTradeSymbols, autoTradeExcludedSymbols, lotSize, autoTradeLotSize,
         takeProfit, stopLoss, timeframe,
         connect, disconnect, fetchAccountInfo, fetchSymbols,
         removeFromWatch, addToWatch, subscribeTick, fetchCandles,
         openPosition, openMultiplePositions,
-        setAutoTrade, setAutoTradeSymbols, toggleAutoTradeSymbol,
+        setAutoTrade, setAutoTradeSymbols, toggleAutoTradeSymbol, toggleAutoTradeExclusion,
         setLotSize, setAutoTradeLotSize, setTakeProfit, setStopLoss,
         setTimeframe, savedCredentials, error,
       }}
