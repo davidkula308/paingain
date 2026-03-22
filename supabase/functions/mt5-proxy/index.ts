@@ -22,12 +22,128 @@ async function parseApiResponse(response: Response): Promise<unknown> {
   }
 }
 
-function hasInvalidStopsError(data: unknown): boolean {
-  if (!data || typeof data !== "object") return false;
-  const payload = data as Record<string, unknown>;
-  const code = String(payload.code || "").toUpperCase();
-  const message = String(payload.message || "").toLowerCase();
-  return code === "INVALID_STOPS" || message.includes("invalid stops");
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function extractTicket(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const direct = Number(value.trim());
+    if (Number.isFinite(direct)) return direct;
+
+    const matched = value.match(/\b(\d{4,})\b/);
+    if (matched) return Number(matched[1]);
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const ticket = extractTicket(item);
+      if (ticket) return ticket;
+    }
+    return undefined;
+  }
+
+  const payload = asRecord(value);
+  if (!payload) return undefined;
+
+  for (const key of ["ticket", "Ticket", "order", "Order", "orderTicket", "positionId", "deal", "result", "id"]) {
+    const ticket = extractTicket(payload[key]);
+    if (ticket) return ticket;
+  }
+
+  return undefined;
+}
+
+function normalizeTradeSide(value: unknown): "Buy" | "Sell" | undefined {
+  const normalized = String(value ?? "").toLowerCase();
+  if (normalized.includes("buy")) return "Buy";
+  if (normalized.includes("sell")) return "Sell";
+  return undefined;
+}
+
+type OpenOrderSnapshot = {
+  ticket: number;
+  symbol: string;
+  lots: number;
+  openPrice: number;
+  operation: "Buy" | "Sell";
+};
+
+function toOpenOrderSnapshot(order: unknown): OpenOrderSnapshot | null {
+  const payload = asRecord(order);
+  if (!payload) return null;
+
+  const ticket = extractTicket(payload.ticket ?? payload.Ticket ?? payload.order ?? payload.Order ?? payload.positionId);
+  const symbol = String(payload.symbol ?? payload.Symbol ?? "").trim();
+  const lots = toFiniteNumber(payload.lots ?? payload.Lots ?? payload.volume ?? payload.Volume);
+  const openPrice = toFiniteNumber(payload.openPrice ?? payload.OpenPrice ?? payload.price ?? payload.Price);
+  const operation = normalizeTradeSide(payload.type ?? payload.Type ?? payload.operation ?? payload.Operation ?? payload.orderType ?? payload.OrderType);
+
+  if (!ticket || !symbol || lots === undefined || openPrice === undefined || !operation) {
+    return null;
+  }
+
+  return { ticket, symbol, lots, openPrice, operation };
+}
+
+async function getOpenedOrderByTicket(connectionId: string, ticket: number): Promise<OpenOrderSnapshot | null> {
+  const response = await fetchWithRetry(
+    `${MT5_API_URL}/OpenedOrder?id=${encodeURIComponent(connectionId)}&ticket=${encodeURIComponent(String(ticket))}`,
+    { method: "GET" },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+  return toOpenOrderSnapshot(await parseApiResponse(response));
+}
+
+async function findLatestOpenedOrder(
+  connectionId: string,
+  symbol: string,
+  operation: "Buy" | "Sell",
+  volume: number
+): Promise<OpenOrderSnapshot | null> {
+  const response = await fetchWithRetry(
+    `${MT5_API_URL}/OpenedOrders?id=${encodeURIComponent(connectionId)}`,
+    { method: "GET" },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+
+  const data = await parseApiResponse(response);
+  if (!Array.isArray(data)) return null;
+
+  const matched = data
+    .map(toOpenOrderSnapshot)
+    .filter((order): order is OpenOrderSnapshot => Boolean(order))
+    .filter((order) => order.symbol === symbol && order.operation === operation && Math.abs(order.lots - volume) < 1e-8)
+    .sort((a, b) => b.ticket - a.ticket);
+
+  return matched[0] ?? null;
+}
+
+async function applyStopsToOpenedOrder(
+  connectionId: string,
+  order: OpenOrderSnapshot,
+  tp?: number,
+  sl?: number
+): Promise<unknown> {
+  let url = `${MT5_API_URL}/OrderModifySafe?id=${encodeURIComponent(connectionId)}&ticket=${encodeURIComponent(String(order.ticket))}&symbol=${encodeURIComponent(order.symbol)}&lots=${encodeURIComponent(String(order.lots))}&price=${encodeURIComponent(String(order.openPrice))}&type=${encodeURIComponent(order.operation)}`;
+
+  if (tp !== undefined && Number.isFinite(tp) && tp > 0) {
+    url += `&tp=${encodeURIComponent(String(tp))}`;
+  }
+  if (sl !== undefined && Number.isFinite(sl) && sl > 0) {
+    url += `&sl=${encodeURIComponent(String(sl))}`;
+  }
+
+  console.log("Modify URL:", url);
+  const response = await fetchWithRetry(url, { method: "GET" }, DEFAULT_REQUEST_TIMEOUT_MS);
+  return parseApiResponse(response);
 }
 
 // Map timeframe strings to MT5 integer values
@@ -181,33 +297,51 @@ serve(async (req) => {
       const slNum = Number(sl);
       const hasStops = (Number.isFinite(tpNum) && tpNum > 0) || (Number.isFinite(slNum) && slNum > 0);
 
-      const sendOrder = async (includeStops: boolean) => {
-        let url = `${MT5_API_URL}/OrderSend?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
-        if (includeStops && Number.isFinite(tpNum) && tpNum > 0) {
-          url += `&takeProfit=${encodeURIComponent(String(tpNum))}`;
-        }
-        if (includeStops && Number.isFinite(slNum) && slNum > 0) {
-          url += `&stopLoss=${encodeURIComponent(String(slNum))}`;
-        }
-
+      const sendOrder = async () => {
+        const url = `${MT5_API_URL}/OrderSendSafe?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
         console.log("Trade URL:", url);
         const response = await fetchWithRetry(url, { method: "GET" }, DEFAULT_REQUEST_TIMEOUT_MS);
         return parseApiResponse(response);
       };
 
-      let data = await sendOrder(hasStops);
+      const openedOrderResult = await sendOrder();
+      const responsePayload = asRecord(openedOrderResult)
+        ? { ...(openedOrderResult as Record<string, unknown>) }
+        : { result: openedOrderResult };
 
-      // Fallback: some brokers reject TP/SL format on market orders; retry without stops.
-      if (hasStops && hasInvalidStopsError(data)) {
-        const retryData = await sendOrder(false);
-        if (retryData && typeof retryData === "object") {
-          data = { ...(retryData as Record<string, unknown>), retriedWithoutStops: true };
+      if (hasStops) {
+        let orderSnapshot: OpenOrderSnapshot | null = null;
+        const openedTicket = extractTicket(openedOrderResult);
+
+        if (openedTicket) {
+          orderSnapshot = await getOpenedOrderByTicket(connectionId, openedTicket);
+        }
+
+        if (!orderSnapshot) {
+          orderSnapshot = await findLatestOpenedOrder(connectionId, symbol, operation, numericVolume);
+        }
+
+        if (orderSnapshot) {
+          try {
+            const modifyResult = await applyStopsToOpenedOrder(connectionId, orderSnapshot, tpNum, slNum);
+            responsePayload.ticket = orderSnapshot.ticket;
+            responsePayload.stopsApplied = true;
+            responsePayload.modifyResult = modifyResult;
+          } catch (modifyError) {
+            console.error("Failed to apply TP/SL after order open:", modifyError);
+            responsePayload.ticket = orderSnapshot.ticket;
+            responsePayload.stopsApplied = false;
+            responsePayload.warning = modifyError instanceof Error
+              ? modifyError.message
+              : "Trade opened, but TP/SL modification failed";
+          }
         } else {
-          data = { result: retryData, retriedWithoutStops: true };
+          responsePayload.stopsApplied = false;
+          responsePayload.warning = "Trade opened, but the new position could not be resolved for TP/SL update";
         }
       }
 
-      return new Response(JSON.stringify(data), {
+      return new Response(JSON.stringify(responsePayload), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
