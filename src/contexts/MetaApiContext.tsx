@@ -573,8 +573,8 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
       const isBuy = type.toLowerCase() === "buy";
       const basePrice = isBuy ? tick.ask : tick.bid;
-      const pipValue = precision > 0 ? 1 / 10 ** precision : 1;
       const precision = Math.max(countDecimals(tick.bid), countDecimals(tick.ask));
+      const pipValue = precision > 0 ? 1 / 10 ** precision : 1;
       const roundToPrecision = (value: number) => Number(value.toFixed(precision));
 
       const tpPrice =
