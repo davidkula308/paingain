@@ -4,6 +4,7 @@ const MT5_API_URL = "https://mt5.mtapi.io";
 const MAX_RETRIES = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 7000;
 const CONNECT_REQUEST_TIMEOUT_MS = 20000;
+const PRICE_TOLERANCE = 1e-6;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -75,6 +76,8 @@ type OpenOrderSnapshot = {
   openPrice: number;
   operation: "Buy" | "Sell";
   openedAt?: number;
+  stopLoss?: number;
+  takeProfit?: number;
 };
 
 function normalizeSymbol(value: unknown): string {
@@ -111,6 +114,8 @@ function toOpenOrderSnapshot(order: unknown): OpenOrderSnapshot | null {
   const lots = toFiniteNumber(payload.lots ?? payload.Lots ?? payload.volume ?? payload.Volume);
   const openPrice = toFiniteNumber(payload.openPrice ?? payload.OpenPrice ?? payload.price ?? payload.Price);
   const operation = normalizeTradeSide(payload.type ?? payload.Type ?? payload.operation ?? payload.Operation ?? payload.orderType ?? payload.OrderType);
+  const stopLoss = toFiniteNumber(payload.stopLoss ?? payload.StopLoss ?? payload.stoploss ?? payload.sl ?? payload.SL);
+  const takeProfit = toFiniteNumber(payload.takeProfit ?? payload.TakeProfit ?? payload.takeprofit ?? payload.tp ?? payload.TP);
   const openedAt = parseTimestamp(
     payload.openTime ?? payload.OpenTime ?? payload.time ?? payload.Time ?? payload.date ?? payload.Date ?? payload.createdAt
   );
@@ -119,7 +124,23 @@ function toOpenOrderSnapshot(order: unknown): OpenOrderSnapshot | null {
     return null;
   }
 
-  return { ticket, symbol, lots, openPrice, operation, openedAt };
+  return { ticket, symbol, lots, openPrice, operation, openedAt, stopLoss, takeProfit };
+}
+
+function approximatelyEqual(a: number, b: number): boolean {
+  return Math.abs(a - b) <= Math.max(PRICE_TOLERANCE, Math.abs(a) * 1e-8, Math.abs(b) * 1e-8);
+}
+
+function hasExpectedStops(order: OpenOrderSnapshot | null, tp?: number, sl?: number): boolean {
+  if (!order) return false;
+
+  const expectsTp = Number.isFinite(tp) && Number(tp) > 0;
+  const expectsSl = Number.isFinite(sl) && Number(sl) > 0;
+
+  const tpMatches = !expectsTp || (order.takeProfit !== undefined && approximatelyEqual(order.takeProfit, Number(tp)));
+  const slMatches = !expectsSl || (order.stopLoss !== undefined && approximatelyEqual(order.stopLoss, Number(sl)));
+
+  return tpMatches && slMatches;
 }
 
 function isTradeFailurePayload(value: unknown): boolean {
@@ -189,13 +210,13 @@ async function applyStopsToOpenedOrder(
   tp?: number,
   sl?: number
 ): Promise<unknown> {
-  let url = `${MT5_API_URL}/OrderModifySafe?id=${encodeURIComponent(connectionId)}&ticket=${encodeURIComponent(String(order.ticket))}&symbol=${encodeURIComponent(order.symbol)}&lots=${encodeURIComponent(String(order.lots))}&price=${encodeURIComponent(String(order.openPrice))}&type=${encodeURIComponent(order.operation)}`;
+  const takeProfit = Number.isFinite(tp) && Number(tp) > 0 ? Number(tp) : 0;
+  const stopLoss = Number.isFinite(sl) && Number(sl) > 0 ? Number(sl) : 0;
 
-  if (tp !== undefined && Number.isFinite(tp) && tp > 0) {
-    url += `&tp=${encodeURIComponent(String(tp))}`;
-  }
-  if (sl !== undefined && Number.isFinite(sl) && sl > 0) {
-    url += `&sl=${encodeURIComponent(String(sl))}`;
+  let url = `${MT5_API_URL}/OrderModifySafe?id=${encodeURIComponent(connectionId)}&ticket=${encodeURIComponent(String(order.ticket))}&stoploss=${encodeURIComponent(String(stopLoss))}&takeprofit=${encodeURIComponent(String(takeProfit))}`;
+
+  if (Number.isFinite(order.openPrice) && order.openPrice > 0) {
+    url += `&price=${encodeURIComponent(String(order.openPrice))}`;
   }
 
   console.log("Modify URL:", url);
@@ -386,7 +407,13 @@ serve(async (req) => {
       const requestedAt = Date.now();
 
       const sendOrder = async () => {
-        const url = `${MT5_API_URL}/OrderSendSafe?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
+        let url = `${MT5_API_URL}/OrderSendSafe?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
+        if (Number.isFinite(slNum) && slNum > 0) {
+          url += `&stoploss=${encodeURIComponent(String(slNum))}`;
+        }
+        if (Number.isFinite(tpNum) && tpNum > 0) {
+          url += `&takeprofit=${encodeURIComponent(String(tpNum))}`;
+        }
         console.log("Trade URL:", url);
         const response = await fetchWithRetry(url, { method: "GET" }, DEFAULT_REQUEST_TIMEOUT_MS);
         return parseApiResponse(response);
@@ -409,6 +436,15 @@ serve(async (req) => {
       if (hasStops) {
         const openedTicket = extractTicket(openedOrderResult);
         const directOrder = toOpenOrderSnapshot(openedOrderResult);
+
+        if (hasExpectedStops(directOrder, tpNum, slNum)) {
+          responsePayload.ticket = directOrder?.ticket;
+          responsePayload.stopsApplied = true;
+          return new Response(JSON.stringify(responsePayload), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+
         const orderSnapshot = await waitForOpenedOrder(
           connectionId,
           symbol,
@@ -420,11 +456,33 @@ serve(async (req) => {
         );
 
         if (orderSnapshot) {
-          try {
-            const modifyResult = await applyStopsToOpenedOrder(connectionId, orderSnapshot, tpNum, slNum);
+          if (hasExpectedStops(orderSnapshot, tpNum, slNum)) {
             responsePayload.ticket = orderSnapshot.ticket;
             responsePayload.stopsApplied = true;
+            return new Response(JSON.stringify(responsePayload), {
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          }
+
+          try {
+            const modifyResult = await applyStopsToOpenedOrder(connectionId, orderSnapshot, tpNum, slNum);
+            const verifiedOrder = await waitForOpenedOrder(
+              connectionId,
+              symbol,
+              operation,
+              numericVolume,
+              orderSnapshot.ticket,
+              requestedAt,
+              null
+            );
+
+            responsePayload.ticket = orderSnapshot.ticket;
+            responsePayload.stopsApplied = hasExpectedStops(verifiedOrder, tpNum, slNum);
             responsePayload.modifyResult = modifyResult;
+
+            if (!responsePayload.stopsApplied) {
+              responsePayload.warning = "Trade opened, but TP/SL could not be verified after modification";
+            }
           } catch (modifyError) {
             console.error("Failed to apply TP/SL after order open:", modifyError);
             responsePayload.ticket = orderSnapshot.ticket;
