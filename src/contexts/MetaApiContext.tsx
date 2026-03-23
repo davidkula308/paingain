@@ -116,6 +116,7 @@ interface TradeExecutionResponse {
   error?: string;
   warning?: string;
   stopsApplied?: boolean;
+  ticket?: number;
 }
 
 interface Candle {
@@ -133,6 +134,7 @@ interface SpikeEvent {
   percentage: number;
   timestamp: number;
   candle: Candle;
+  key: string;
 }
 
 interface TradeResult {
@@ -214,6 +216,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const hasFetchedRef = useRef(false);
   const autoConnectAttempted = useRef(false);
   const processedSpikeKeysRef = useRef<Set<string>>(new Set());
+  const activeAutoTradeSpikeKeyRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
 
   const [savedCredentials] = useState(() => loadCredentials());
@@ -572,22 +575,36 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (!tick) return { tpPrice: undefined, slPrice: undefined };
 
       const isBuy = type.toLowerCase() === "buy";
-      const basePrice = isBuy ? tick.ask : tick.bid;
+      const entryPrice = isBuy ? tick.ask : tick.bid;
       const precision = Math.max(countDecimals(tick.bid), countDecimals(tick.ask));
       const pipValue = precision > 0 ? 1 / 10 ** precision : 1;
       const roundToPrecision = (value: number) => Number(value.toFixed(precision));
+      const spread = Math.max(Math.abs(tick.ask - tick.bid), pipValue);
 
       const tpPrice =
         typeof tpPips === "number" && tpPips > 0
-          ? roundToPrecision(isBuy ? basePrice + tpPips * pipValue : basePrice - tpPips * pipValue)
+          ? roundToPrecision(isBuy ? entryPrice + tpPips * pipValue : entryPrice - tpPips * pipValue)
           : undefined;
 
       const slPrice =
         typeof slPips === "number" && slPips > 0
-          ? roundToPrecision(isBuy ? basePrice - slPips * pipValue : basePrice + slPips * pipValue)
+          ? roundToPrecision(
+              isBuy
+                ? tick.bid - slPips * pipValue
+                : tick.ask + slPips * pipValue
+            )
           : undefined;
 
-      return { tpPrice, slPrice };
+      const normalizedSlPrice =
+        slPrice !== undefined
+          ? roundToPrecision(
+              isBuy
+                ? Math.min(slPrice, entryPrice - spread)
+                : Math.max(slPrice, entryPrice + spread)
+            )
+          : undefined;
+
+      return { tpPrice, slPrice: normalizedSlPrice };
     },
     [countDecimals]
   );
@@ -617,6 +634,9 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (data?.error) throw new Error(data.error);
 
       const tradeResponse = data as TradeExecutionResponse | null;
+      if (tradeResponse?.stopsApplied === false) {
+        throw new Error(tradeResponse.warning || "Trade opened but TP/SL could not be applied");
+      }
       if (tradeResponse?.warning) {
         toast.warning(tradeResponse.warning);
       }
@@ -677,6 +697,12 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
     [openPosition, fetchAccountInfo]
   );
 
+  const toMinuteBucket = useCallback((time: string) => {
+    const timestamp = new Date(time).getTime();
+    if (Number.isNaN(timestamp)) return time;
+    return String(Math.floor(timestamp / 60000));
+  }, []);
+
   const detectSpikes = useCallback(async () => {
     if (!isConnected) return;
 
@@ -708,10 +734,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const spikeRatio = bodySize / prevBody;
       if (spikeRatio < 3) continue;
 
-      const candleTimestamp = new Date(last.time).getTime();
-      if (Number.isNaN(candleTimestamp)) continue;
-
-      const spikeKey = `${symbol}:${candleTimestamp}`;
+      const spikeKey = `${symbol}:${toMinuteBucket(last.time)}`;
       if (processedSpikeKeysRef.current.has(spikeKey)) continue;
       if (processedSpikeKeysRef.current.size > 2000) {
         processedSpikeKeysRef.current.clear();
@@ -726,6 +749,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
         percentage,
         timestamp: Date.now(),
         candle: last,
+        key: spikeKey,
       };
 
       newSpikes.push(spikeEvent);
@@ -742,21 +766,30 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
         (a, b) => extractIndexNumber(b.symbol) - extractIndexNumber(a.symbol)
       );
       const chosen = sorted[0];
+      if (activeAutoTradeSpikeKeyRef.current === chosen.key) {
+        return;
+      }
+
+      activeAutoTradeSpikeKeyRef.current = chosen.key;
       const tradeType = getAutoTradeDirection(chosen.symbol, chosen.direction);
 
       toast.info(`Auto-trading ${tradeType.toUpperCase()} on ${chosen.symbol} (highest index: ${extractIndexNumber(chosen.symbol)})`, { duration: 4000 });
 
-      const totalOpened = await openTradesUntilMarginExhausted(
-        chosen.symbol, tradeType, autoTradeLotSize, takeProfit, stopLoss
-      );
+      try {
+        const totalOpened = await openTradesUntilMarginExhausted(
+          chosen.symbol, tradeType, autoTradeLotSize, takeProfit, stopLoss
+        );
 
-      if (totalOpened > 0) {
-        toast.success(`Auto-${tradeType.toUpperCase()} opened ${totalOpened} trades on ${chosen.symbol} until margin exhausted`);
-      } else {
-        toast.error(`Auto-trade failed on ${chosen.symbol} — insufficient margin`);
+        if (totalOpened > 0) {
+          toast.success(`Auto-${tradeType.toUpperCase()} opened ${totalOpened} trades on ${chosen.symbol} until margin exhausted`);
+        } else {
+          toast.error(`Auto-trade skipped ${chosen.symbol} — waiting for the next fresh spike`);
+        }
+
+        await fetchAccountInfo();
+      } finally {
+        activeAutoTradeSpikeKeyRef.current = null;
       }
-
-      await fetchAccountInfo();
     }
   }, [
     isConnected,
@@ -772,6 +805,7 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
     sendSpikeNotification,
     openTradesUntilMarginExhausted,
     fetchAccountInfo,
+    toMinuteBucket,
   ]);
 
   useEffect(() => {

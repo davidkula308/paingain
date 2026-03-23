@@ -74,7 +74,33 @@ type OpenOrderSnapshot = {
   lots: number;
   openPrice: number;
   operation: "Buy" | "Sell";
+  openedAt?: number;
 };
+
+function normalizeSymbol(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function parseTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return numeric > 1e12 ? numeric : numeric * 1000;
+    }
+
+    const parsed = Date.parse(trimmed);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+
+  return undefined;
+}
 
 function toOpenOrderSnapshot(order: unknown): OpenOrderSnapshot | null {
   const payload = asRecord(order);
@@ -85,12 +111,29 @@ function toOpenOrderSnapshot(order: unknown): OpenOrderSnapshot | null {
   const lots = toFiniteNumber(payload.lots ?? payload.Lots ?? payload.volume ?? payload.Volume);
   const openPrice = toFiniteNumber(payload.openPrice ?? payload.OpenPrice ?? payload.price ?? payload.Price);
   const operation = normalizeTradeSide(payload.type ?? payload.Type ?? payload.operation ?? payload.Operation ?? payload.orderType ?? payload.OrderType);
+  const openedAt = parseTimestamp(
+    payload.openTime ?? payload.OpenTime ?? payload.time ?? payload.Time ?? payload.date ?? payload.Date ?? payload.createdAt
+  );
 
   if (!ticket || !symbol || lots === undefined || openPrice === undefined || !operation) {
     return null;
   }
 
-  return { ticket, symbol, lots, openPrice, operation };
+  return { ticket, symbol, lots, openPrice, operation, openedAt };
+}
+
+function isTradeFailurePayload(value: unknown): boolean {
+  const payload = asRecord(value);
+  if (!payload) return false;
+
+  if (payload.error) return true;
+
+  const code = String(payload.code ?? "").toUpperCase();
+  const hasTicket = extractTicket(payload) !== undefined;
+  if (!code) return false;
+  if (["OK", "SUCCESS", "DONE", "PLACED"].includes(code)) return false;
+
+  return !hasTicket;
 }
 
 async function getOpenedOrderByTicket(connectionId: string, ticket: number): Promise<OpenOrderSnapshot | null> {
@@ -106,7 +149,8 @@ async function findLatestOpenedOrder(
   connectionId: string,
   symbol: string,
   operation: "Buy" | "Sell",
-  volume: number
+  volume: number,
+  requestedAt?: number
 ): Promise<OpenOrderSnapshot | null> {
   const response = await fetchWithRetry(
     `${MT5_API_URL}/OpenedOrders?id=${encodeURIComponent(connectionId)}`,
@@ -117,11 +161,24 @@ async function findLatestOpenedOrder(
   const data = await parseApiResponse(response);
   if (!Array.isArray(data)) return null;
 
+  const targetSymbol = normalizeSymbol(symbol);
   const matched = data
     .map(toOpenOrderSnapshot)
     .filter((order): order is OpenOrderSnapshot => Boolean(order))
-    .filter((order) => order.symbol === symbol && order.operation === operation && Math.abs(order.lots - volume) < 1e-8)
-    .sort((a, b) => b.ticket - a.ticket);
+    .filter((order) => normalizeSymbol(order.symbol) === targetSymbol && order.operation === operation)
+    .sort((a, b) => {
+      const aRecency = a.openedAt ?? a.ticket;
+      const bRecency = b.openedAt ?? b.ticket;
+      return bRecency - aRecency;
+    });
+
+  const exactVolumeMatch = matched.find((order) => Math.abs(order.lots - volume) < 1e-6);
+  if (exactVolumeMatch) return exactVolumeMatch;
+
+  const freshMatch = requestedAt
+    ? matched.find((order) => order.openedAt !== undefined && order.openedAt >= requestedAt - 15000)
+    : undefined;
+  if (freshMatch) return freshMatch;
 
   return matched[0] ?? null;
 }
@@ -151,9 +208,15 @@ async function waitForOpenedOrder(
   symbol: string,
   operation: "Buy" | "Sell",
   volume: number,
-  openedTicket?: number
+  openedTicket?: number,
+  requestedAt?: number,
+  directOrder?: OpenOrderSnapshot | null
 ): Promise<OpenOrderSnapshot | null> {
-  const attempts = 8;
+  if (directOrder && normalizeSymbol(directOrder.symbol) === normalizeSymbol(symbol) && directOrder.operation === operation) {
+    return directOrder;
+  }
+
+  const attempts = 20;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (openedTicket) {
@@ -161,10 +224,10 @@ async function waitForOpenedOrder(
       if (byTicket) return byTicket;
     }
 
-    const latestMatch = await findLatestOpenedOrder(connectionId, symbol, operation, volume);
+    const latestMatch = await findLatestOpenedOrder(connectionId, symbol, operation, volume, requestedAt);
     if (latestMatch) return latestMatch;
 
-    await new Promise((resolve) => setTimeout(resolve, 500 + attempt * 250));
+    await new Promise((resolve) => setTimeout(resolve, 700 + attempt * 250));
   }
 
   return null;
@@ -320,6 +383,7 @@ serve(async (req) => {
       const tpNum = Number(tp);
       const slNum = Number(sl);
       const hasStops = (Number.isFinite(tpNum) && tpNum > 0) || (Number.isFinite(slNum) && slNum > 0);
+      const requestedAt = Date.now();
 
       const sendOrder = async () => {
         const url = `${MT5_API_URL}/OrderSendSafe?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
@@ -329,13 +393,31 @@ serve(async (req) => {
       };
 
       const openedOrderResult = await sendOrder();
+      if (isTradeFailurePayload(openedOrderResult)) {
+        const payload = asRecord(openedOrderResult) ?? {};
+        const message = String(payload.message ?? payload.error ?? "Trade execution failed");
+        return new Response(JSON.stringify({ ...payload, error: message }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       const responsePayload = asRecord(openedOrderResult)
         ? { ...(openedOrderResult as Record<string, unknown>) }
         : { result: openedOrderResult };
 
       if (hasStops) {
         const openedTicket = extractTicket(openedOrderResult);
-        const orderSnapshot = await waitForOpenedOrder(connectionId, symbol, operation, numericVolume, openedTicket);
+        const directOrder = toOpenOrderSnapshot(openedOrderResult);
+        const orderSnapshot = await waitForOpenedOrder(
+          connectionId,
+          symbol,
+          operation,
+          numericVolume,
+          openedTicket,
+          requestedAt,
+          directOrder
+        );
 
         if (orderSnapshot) {
           try {
