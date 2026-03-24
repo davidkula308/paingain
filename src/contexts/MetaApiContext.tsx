@@ -119,6 +119,25 @@ interface TradeExecutionResponse {
   ticket?: number;
 }
 
+type ExitMode = "pips" | "candles";
+
+interface SymbolTradingParams {
+  digits: number;
+  tickSize: number;
+  spread: number;
+}
+
+interface CandleManagedTrade {
+  ticket: number;
+  symbol: string;
+  type: "buy" | "sell";
+  volume: number;
+  timeframe: string;
+  openedBucket: number;
+  tpCandles: number;
+  slCandles: number;
+}
+
 interface Candle {
   time: string;
   open: number;
@@ -158,8 +177,11 @@ interface MetaApiContextType {
   autoTradeExcludedSymbols: string[];
   lotSize: number;
   autoTradeLotSize: number;
+  exitMode: ExitMode;
   takeProfit: number;
   stopLoss: number;
+  tpCandles: number;
+  slCandles: number;
   timeframe: string;
   connect: (login: string, password: string, server: string) => Promise<void>;
   disconnect: () => void;
@@ -177,8 +199,11 @@ interface MetaApiContextType {
   toggleAutoTradeExclusion: (symbol: string) => void;
   setLotSize: (v: number) => void;
   setAutoTradeLotSize: (v: number) => void;
+  setExitMode: (v: ExitMode) => void;
   setTakeProfit: (v: number) => void;
   setStopLoss: (v: number) => void;
+  setTpCandles: (v: number) => void;
+  setSlCandles: (v: number) => void;
   setTimeframe: (v: string) => void;
   savedCredentials: { login: string; password: string; server: string } | null;
   error: string | null;
@@ -207,8 +232,11 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [autoTradeExcludedSymbols, setAutoTradeExcludedSymbols] = useState<string[]>(() => loadStoredList(AUTO_TRADE_EXCLUDED_KEY));
   const [lotSize, setLotSize] = useState(0.5);
   const [autoTradeLotSize, setAutoTradeLotSize] = useState(0.5);
+  const [exitMode, setExitMode] = useState<ExitMode>("pips");
   const [takeProfit, setTakeProfit] = useState(5000);
   const [stopLoss, setStopLoss] = useState(8000);
+  const [tpCandles, setTpCandles] = useState(3);
+  const [slCandles, setSlCandles] = useState(1);
   const [timeframe, setTimeframe] = useState("1m");
   const [error, setError] = useState<string | null>(null);
   const tickIntervals = useRef<Record<string, ReturnType<typeof setInterval>>>({});
@@ -218,6 +246,9 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const processedSpikeKeysRef = useRef<Set<string>>(new Set());
   const activeAutoTradeSpikeKeyRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const symbolParamsCacheRef = useRef<Record<string, SymbolTradingParams>>({});
+  const candleManagedTradesRef = useRef<CandleManagedTrade[]>([]);
+  const closingTradeTicketsRef = useRef<Set<number>>(new Set());
 
   const [savedCredentials] = useState(() => loadCredentials());
 
@@ -375,6 +406,9 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setWatchList([]);
     setTicks({});
     setSpikes([]);
+    candleManagedTradesRef.current = [];
+    closingTradeTicketsRef.current.clear();
+    symbolParamsCacheRef.current = {};
     clearCredentials();
     localStorage.removeItem(WATCHLIST_KEY);
   }, []);
@@ -569,63 +603,157 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return text.split(".")[1]?.length ?? 0;
   }, []);
 
+  const fetchSymbolParams = useCallback(async (symbol: string, tick?: TickData | null): Promise<SymbolTradingParams> => {
+    const cached = symbolParamsCacheRef.current[symbol];
+    if (cached) return cached;
+
+    const fallbackDigits = Math.max(countDecimals(tick?.bid ?? 0), countDecimals(tick?.ask ?? 0));
+    const fallbackTickSize = fallbackDigits > 0 ? 1 / 10 ** fallbackDigits : 1;
+    const fallbackSpread = tick ? Math.max(Math.abs(tick.ask - tick.bid) / fallbackTickSize, 0) : 0;
+    const connId = connectionIdRef.current;
+
+    if (!connId) {
+      return { digits: fallbackDigits, tickSize: fallbackTickSize, spread: fallbackSpread };
+    }
+
+    try {
+      const { data, error: fnError } = await supabase.functions.invoke("mt5-proxy", {
+        body: { action: "symbolParams", connectionId: connId, symbol },
+      });
+      if (fnError) throw fnError;
+
+      const digits = Math.max(0, toNumber(data?.digits ?? data?.Digits ?? fallbackDigits));
+      const tickSize = Number(data?.tickSize ?? data?.TickSize ?? data?.point ?? data?.Point) || (digits > 0 ? 1 / 10 ** digits : fallbackTickSize);
+      const spread = toNumber(data?.spread ?? data?.Spread ?? fallbackSpread);
+      const resolved = { digits, tickSize: tickSize > 0 ? tickSize : fallbackTickSize, spread };
+
+      symbolParamsCacheRef.current[symbol] = resolved;
+      return resolved;
+    } catch {
+      return { digits: fallbackDigits, tickSize: fallbackTickSize, spread: fallbackSpread };
+    }
+  }, [countDecimals]);
+
+  const timeframeToMs = useCallback((tf: string) => {
+    const map: Record<string, number> = {
+      "1m": 60_000,
+      "5m": 300_000,
+      "15m": 900_000,
+      "30m": 1_800_000,
+      "1h": 3_600_000,
+      "4h": 14_400_000,
+      "1d": 86_400_000,
+    };
+    return map[tf] ?? 60_000;
+  }, []);
+
+  const toCandleBucket = useCallback((time: string, tf: string) => {
+    const timestamp = new Date(time).getTime();
+    if (Number.isNaN(timestamp)) return Math.floor(Date.now() / timeframeToMs(tf));
+    return Math.floor(timestamp / timeframeToMs(tf));
+  }, [timeframeToMs]);
+
   // Convert entered distance values to actual price levels using the latest quote.
   const pipsToPriceLevel = useCallback(
-    (tick: TickData | null, type: string, tpPips?: number, slPips?: number) => {
+    (tick: TickData | null, type: string, tpPips?: number, slPips?: number, symbolParams?: SymbolTradingParams | null) => {
       if (!tick) return { tpPrice: undefined, slPrice: undefined };
 
       const isBuy = type.toLowerCase() === "buy";
       const entryPrice = isBuy ? tick.ask : tick.bid;
-      const precision = Math.max(countDecimals(tick.bid), countDecimals(tick.ask));
-      const pipValue = precision > 0 ? 1 / 10 ** precision : 1;
+      const tickSize = symbolParams?.tickSize && symbolParams.tickSize > 0
+        ? symbolParams.tickSize
+        : Math.max(1 / 10 ** Math.max(countDecimals(tick.bid), countDecimals(tick.ask)), 1e-8);
+      const precision = Math.max(
+        symbolParams?.digits ?? 0,
+        countDecimals(tick.bid),
+        countDecimals(tick.ask),
+        countDecimals(tickSize),
+      );
       const roundToPrecision = (value: number) => Number(value.toFixed(precision));
-      const spread = Math.max(Math.abs(tick.ask - tick.bid), pipValue);
+      const spreadDistance = symbolParams?.spread && symbolParams.spread > 0
+        ? symbolParams.spread * tickSize
+        : Math.abs(tick.ask - tick.bid);
+      const minimumDistance = Math.max(tickSize, spreadDistance);
+
+      const tpDistance = typeof tpPips === "number" && tpPips > 0 ? Math.max(tpPips * tickSize, minimumDistance) : undefined;
+      const slDistance = typeof slPips === "number" && slPips > 0 ? Math.max(slPips * tickSize, minimumDistance) : undefined;
 
       const tpPrice =
-        typeof tpPips === "number" && tpPips > 0
-          ? roundToPrecision(isBuy ? entryPrice + tpPips * pipValue : entryPrice - tpPips * pipValue)
+        tpDistance !== undefined
+          ? roundToPrecision(isBuy ? entryPrice + tpDistance : entryPrice - tpDistance)
           : undefined;
 
       const slPrice =
-        typeof slPips === "number" && slPips > 0
-          ? roundToPrecision(
-              isBuy
-                ? tick.bid - slPips * pipValue
-                : tick.ask + slPips * pipValue
-            )
+        slDistance !== undefined
+          ? roundToPrecision(isBuy ? entryPrice - slDistance : entryPrice + slDistance)
           : undefined;
 
-      const normalizedSlPrice =
-        slPrice !== undefined
-          ? roundToPrecision(
-              isBuy
-                ? Math.min(slPrice, entryPrice - spread)
-                : Math.max(slPrice, entryPrice + spread)
-            )
-          : undefined;
-
-      return { tpPrice, slPrice: normalizedSlPrice };
+      return { tpPrice, slPrice };
     },
     [countDecimals]
   );
+
+  const closeManagedTrade = useCallback(async (trade: CandleManagedTrade, reason: "tp" | "sl") => {
+    if (closingTradeTicketsRef.current.has(trade.ticket)) return false;
+    closingTradeTicketsRef.current.add(trade.ticket);
+
+    try {
+      const latestTick = await getLatestTick(trade.symbol);
+      const closePrice = trade.type === "buy" ? latestTick?.bid : latestTick?.ask;
+      const connId = connectionIdRef.current;
+      if (!connId) throw new Error("Not connected");
+
+      const { data, error: fnError } = await supabase.functions.invoke("mt5-proxy", {
+        body: {
+          action: "closeOrder",
+          connectionId: connId,
+          ticket: trade.ticket,
+          lots: trade.volume,
+          price: closePrice,
+          symbol: trade.symbol,
+          type: trade.type,
+          comment: `Auto ${reason.toUpperCase()} candle exit`,
+        },
+      });
+      if (fnError) throw fnError;
+      if (data?.error) throw new Error(data.error);
+
+      candleManagedTradesRef.current = candleManagedTradesRef.current.filter((item) => item.ticket !== trade.ticket);
+      toast.success(`${trade.symbol} closed by ${reason.toUpperCase()} candle rule`);
+      return true;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to close trade";
+      toast.error(`${trade.symbol} candle close failed: ${message}`);
+      return false;
+    } finally {
+      closingTradeTicketsRef.current.delete(trade.ticket);
+    }
+  }, [getLatestTick]);
 
   const openPosition = useCallback(
     async (symbol: string, type: string, volume: number, tpPips?: number, slPips?: number) => {
       const connId = connectionIdRef.current;
       if (!connId) throw new Error("Not connected");
 
+      const normalizedType = type.toLowerCase() === "sell" ? "sell" : "buy";
       const latestTick = await getLatestTick(symbol);
-      const { tpPrice, slPrice } = pipsToPriceLevel(latestTick, type, tpPips, slPips);
+      const symbolParams = await fetchSymbolParams(symbol, latestTick);
+      const entryPrice = normalizedType === "buy" ? latestTick?.ask : latestTick?.bid;
+      const { tpPrice, slPrice } = exitMode === "pips"
+        ? pipsToPriceLevel(latestTick, normalizedType, tpPips, slPips, symbolParams)
+        : { tpPrice: undefined, slPrice: undefined };
 
-      console.log(`Opening ${type} ${volume} lots on ${symbol} | TP pips: ${tpPips} → price: ${tpPrice} | SL pips: ${slPips} → price: ${slPrice}`);
+      console.log(`Opening ${normalizedType} ${volume} lots on ${symbol} | mode: ${exitMode} | TP input: ${tpPips} → price: ${tpPrice} | SL input: ${slPips} → price: ${slPrice}`);
 
       const { data, error: fnError } = await supabase.functions.invoke("mt5-proxy", {
         body: {
           action: "trade",
           connectionId: connId,
           symbol,
-          type,
+          type: normalizedType,
           volume,
+          price: entryPrice,
+          slippage: Math.max(2, Math.ceil(symbolParams.spread || 0)),
           tp: tpPrice,
           sl: slPrice,
         },
@@ -634,16 +762,36 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (data?.error) throw new Error(data.error);
 
       const tradeResponse = data as TradeExecutionResponse | null;
-      if (tradeResponse?.stopsApplied === false) {
+      if (exitMode === "pips" && tradeResponse?.stopsApplied === false) {
         throw new Error(tradeResponse.warning || "Trade opened but TP/SL could not be applied");
       }
       if (tradeResponse?.warning) {
         toast.warning(tradeResponse.warning);
       }
 
+      if (exitMode === "candles" && tradeResponse?.ticket) {
+        const effectiveTpCandles = Math.max(0, Math.floor(tpPips || 0));
+        const effectiveSlCandles = Math.max(0, Math.floor(slPips || 0));
+        if (effectiveTpCandles > 0 || effectiveSlCandles > 0) {
+          candleManagedTradesRef.current = [
+            ...candleManagedTradesRef.current.filter((trade) => trade.ticket !== tradeResponse.ticket),
+            {
+              ticket: tradeResponse.ticket,
+              symbol,
+              type: normalizedType,
+              volume,
+              timeframe,
+              openedBucket: latestTick?.time ? toCandleBucket(latestTick.time, timeframe) : Math.floor(Date.now() / timeframeToMs(timeframe)),
+              tpCandles: effectiveTpCandles,
+              slCandles: effectiveSlCandles,
+            },
+          ];
+        }
+      }
+
       return data;
     },
-    [getLatestTick, pipsToPriceLevel]
+    [exitMode, fetchSymbolParams, getLatestTick, pipsToPriceLevel, timeframe, timeframeToMs, toCandleBucket]
   );
 
   // Open multiple positions with retry and per-trade error reporting
@@ -653,21 +801,21 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       for (let i = 0; i < count; i++) {
         let success = false;
         let lastError = "";
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             await openPosition(symbol, type, volume, tp, sl);
             success = true;
             break;
           } catch (err: unknown) {
             lastError = err instanceof Error ? err.message : "Trade failed";
-            if (attempt < 1) {
-              await new Promise((r) => setTimeout(r, 400));
+            if (attempt < 2) {
+              await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
             }
           }
         }
         results.push({ index: i + 1, success, error: success ? undefined : lastError });
         if (i < count - 1) {
-          await new Promise((r) => setTimeout(r, 600));
+          await new Promise((r) => setTimeout(r, 120));
         }
       }
       return results;
@@ -679,23 +827,69 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const openTradesUntilMarginExhausted = useCallback(
     async (symbol: string, tradeType: string, volume: number, tp?: number, sl?: number) => {
       let totalOpened = 0;
+      let consecutiveFailures = 0;
       const MAX_SAFETY = 200;
       for (let i = 0; i < MAX_SAFETY; i++) {
         try {
           await openPosition(symbol, tradeType, volume, tp, sl);
           totalOpened++;
-          await fetchAccountInfo();
-          await new Promise((r) => setTimeout(r, 400));
+          consecutiveFailures = 0;
+          if (totalOpened === 1 || totalOpened % 3 === 0) {
+            await fetchAccountInfo();
+          }
+          await new Promise((r) => setTimeout(r, 150));
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : "";
           console.log(`Auto-trade stopped after ${totalOpened} trades: ${msg}`);
-          break;
+          consecutiveFailures++;
+          if (consecutiveFailures >= 3) break;
+          await new Promise((r) => setTimeout(r, 250 * consecutiveFailures));
         }
       }
       return totalOpened;
     },
     [openPosition, fetchAccountInfo]
   );
+
+  useEffect(() => {
+    if (!isConnected || exitMode !== "candles") return;
+
+    const interval = setInterval(() => {
+      void (async () => {
+        const managedTrades = [...candleManagedTradesRef.current];
+        if (!managedTrades.length) return;
+
+        const groups = new Map<string, CandleManagedTrade[]>();
+        managedTrades.forEach((trade) => {
+          const key = `${trade.symbol}:${trade.timeframe}`;
+          groups.set(key, [...(groups.get(key) ?? []), trade]);
+        });
+
+        for (const [key, trades] of groups.entries()) {
+          const [symbol, tradeTimeframe] = key.split(":");
+          const candleCount = Math.max(...trades.map((trade) => Math.max(trade.tpCandles, trade.slCandles)), 1) + 4;
+          const candles = await fetchCandles(symbol, tradeTimeframe, candleCount);
+          if (candles.length < 2) continue;
+
+          const lastClosedCandle = candles[candles.length - 2];
+          const lastClosedBucket = toCandleBucket(lastClosedCandle.time, tradeTimeframe);
+
+          for (const trade of trades) {
+            const closedCandleCount = Math.max(0, lastClosedBucket - trade.openedBucket);
+            const tpHit = trade.tpCandles > 0 && closedCandleCount >= trade.tpCandles;
+            const slHit = trade.slCandles > 0 && closedCandleCount >= trade.slCandles;
+
+            if (tpHit || slHit) {
+              const reason = tpHit && (!slHit || trade.tpCandles <= trade.slCandles) ? "tp" : "sl";
+              await closeManagedTrade(trade, reason);
+            }
+          }
+        }
+      })();
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [closeManagedTrade, exitMode, fetchCandles, isConnected, toCandleBucket]);
 
   const toMinuteBucket = useCallback((time: string) => {
     const timestamp = new Date(time).getTime();
@@ -832,12 +1026,12 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
         isConnected, isConnecting, connectionId, accountInfo,
         symbols, syntheticSymbols, watchList, ticks, spikes,
         autoTrade, autoTradeSymbols, autoTradeExcludedSymbols, lotSize, autoTradeLotSize,
-        takeProfit, stopLoss, timeframe,
+        exitMode, takeProfit, stopLoss, tpCandles, slCandles, timeframe,
         connect, disconnect, fetchAccountInfo, fetchSymbols,
         removeFromWatch, addToWatch, subscribeTick, fetchCandles,
         openPosition, openMultiplePositions,
         setAutoTrade, setAutoTradeSymbols, toggleAutoTradeSymbol, toggleAutoTradeExclusion,
-        setLotSize, setAutoTradeLotSize, setTakeProfit, setStopLoss,
+        setLotSize, setAutoTradeLotSize, setExitMode, setTakeProfit, setStopLoss, setTpCandles, setSlCandles,
         setTimeframe, savedCredentials, error,
       }}
     >
