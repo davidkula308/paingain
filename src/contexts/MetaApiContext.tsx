@@ -119,6 +119,25 @@ interface TradeExecutionResponse {
   ticket?: number;
 }
 
+type ExitMode = "pips" | "candles";
+
+interface SymbolTradingParams {
+  digits: number;
+  tickSize: number;
+  spread: number;
+}
+
+interface CandleManagedTrade {
+  ticket: number;
+  symbol: string;
+  type: "buy" | "sell";
+  volume: number;
+  timeframe: string;
+  openedBucket: number;
+  tpCandles: number;
+  slCandles: number;
+}
+
 interface Candle {
   time: string;
   open: number;
@@ -158,8 +177,11 @@ interface MetaApiContextType {
   autoTradeExcludedSymbols: string[];
   lotSize: number;
   autoTradeLotSize: number;
+  exitMode: ExitMode;
   takeProfit: number;
   stopLoss: number;
+  tpCandles: number;
+  slCandles: number;
   timeframe: string;
   connect: (login: string, password: string, server: string) => Promise<void>;
   disconnect: () => void;
@@ -177,8 +199,11 @@ interface MetaApiContextType {
   toggleAutoTradeExclusion: (symbol: string) => void;
   setLotSize: (v: number) => void;
   setAutoTradeLotSize: (v: number) => void;
+  setExitMode: (v: ExitMode) => void;
   setTakeProfit: (v: number) => void;
   setStopLoss: (v: number) => void;
+  setTpCandles: (v: number) => void;
+  setSlCandles: (v: number) => void;
   setTimeframe: (v: string) => void;
   savedCredentials: { login: string; password: string; server: string } | null;
   error: string | null;
@@ -207,8 +232,11 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [autoTradeExcludedSymbols, setAutoTradeExcludedSymbols] = useState<string[]>(() => loadStoredList(AUTO_TRADE_EXCLUDED_KEY));
   const [lotSize, setLotSize] = useState(0.5);
   const [autoTradeLotSize, setAutoTradeLotSize] = useState(0.5);
+  const [exitMode, setExitMode] = useState<ExitMode>("pips");
   const [takeProfit, setTakeProfit] = useState(5000);
   const [stopLoss, setStopLoss] = useState(8000);
+  const [tpCandles, setTpCandles] = useState(3);
+  const [slCandles, setSlCandles] = useState(1);
   const [timeframe, setTimeframe] = useState("1m");
   const [error, setError] = useState<string | null>(null);
   const tickIntervals = useRef<Record<string, ReturnType<typeof setInterval>>>({});
@@ -218,6 +246,9 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const processedSpikeKeysRef = useRef<Set<string>>(new Set());
   const activeAutoTradeSpikeKeyRef = useRef<string | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const symbolParamsCacheRef = useRef<Record<string, SymbolTradingParams>>({});
+  const candleManagedTradesRef = useRef<CandleManagedTrade[]>([]);
+  const closingTradeTicketsRef = useRef<Set<number>>(new Set());
 
   const [savedCredentials] = useState(() => loadCredentials());
 
