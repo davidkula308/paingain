@@ -801,21 +801,21 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
       for (let i = 0; i < count; i++) {
         let success = false;
         let lastError = "";
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 3; attempt++) {
           try {
             await openPosition(symbol, type, volume, tp, sl);
             success = true;
             break;
           } catch (err: unknown) {
             lastError = err instanceof Error ? err.message : "Trade failed";
-            if (attempt < 1) {
-              await new Promise((r) => setTimeout(r, 400));
+            if (attempt < 2) {
+              await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
             }
           }
         }
         results.push({ index: i + 1, success, error: success ? undefined : lastError });
         if (i < count - 1) {
-          await new Promise((r) => setTimeout(r, 600));
+          await new Promise((r) => setTimeout(r, 120));
         }
       }
       return results;
@@ -827,23 +827,69 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const openTradesUntilMarginExhausted = useCallback(
     async (symbol: string, tradeType: string, volume: number, tp?: number, sl?: number) => {
       let totalOpened = 0;
+      let consecutiveFailures = 0;
       const MAX_SAFETY = 200;
       for (let i = 0; i < MAX_SAFETY; i++) {
         try {
           await openPosition(symbol, tradeType, volume, tp, sl);
           totalOpened++;
-          await fetchAccountInfo();
-          await new Promise((r) => setTimeout(r, 400));
+          consecutiveFailures = 0;
+          if (totalOpened === 1 || totalOpened % 3 === 0) {
+            await fetchAccountInfo();
+          }
+          await new Promise((r) => setTimeout(r, 150));
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : "";
           console.log(`Auto-trade stopped after ${totalOpened} trades: ${msg}`);
-          break;
+          consecutiveFailures++;
+          if (consecutiveFailures >= 3) break;
+          await new Promise((r) => setTimeout(r, 250 * consecutiveFailures));
         }
       }
       return totalOpened;
     },
     [openPosition, fetchAccountInfo]
   );
+
+  useEffect(() => {
+    if (!isConnected || exitMode !== "candles") return;
+
+    const interval = setInterval(() => {
+      void (async () => {
+        const managedTrades = [...candleManagedTradesRef.current];
+        if (!managedTrades.length) return;
+
+        const groups = new Map<string, CandleManagedTrade[]>();
+        managedTrades.forEach((trade) => {
+          const key = `${trade.symbol}:${trade.timeframe}`;
+          groups.set(key, [...(groups.get(key) ?? []), trade]);
+        });
+
+        for (const [key, trades] of groups.entries()) {
+          const [symbol, tradeTimeframe] = key.split(":");
+          const candleCount = Math.max(...trades.map((trade) => Math.max(trade.tpCandles, trade.slCandles)), 1) + 4;
+          const candles = await fetchCandles(symbol, tradeTimeframe, candleCount);
+          if (candles.length < 2) continue;
+
+          const lastClosedCandle = candles[candles.length - 2];
+          const lastClosedBucket = toCandleBucket(lastClosedCandle.time, tradeTimeframe);
+
+          for (const trade of trades) {
+            const closedCandleCount = Math.max(0, lastClosedBucket - trade.openedBucket);
+            const tpHit = trade.tpCandles > 0 && closedCandleCount >= trade.tpCandles;
+            const slHit = trade.slCandles > 0 && closedCandleCount >= trade.slCandles;
+
+            if (tpHit || slHit) {
+              const reason = tpHit && (!slHit || trade.tpCandles <= trade.slCandles) ? "tp" : "sl";
+              await closeManagedTrade(trade, reason);
+            }
+          }
+        }
+      })();
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [closeManagedTrade, exitMode, fetchCandles, isConnected, toCandleBucket]);
 
   const toMinuteBucket = useCallback((time: string) => {
     const timestamp = new Date(time).getTime();
@@ -980,12 +1026,12 @@ export const MetaApiProvider: React.FC<{ children: React.ReactNode }> = ({ child
         isConnected, isConnecting, connectionId, accountInfo,
         symbols, syntheticSymbols, watchList, ticks, spikes,
         autoTrade, autoTradeSymbols, autoTradeExcludedSymbols, lotSize, autoTradeLotSize,
-        takeProfit, stopLoss, timeframe,
+        exitMode, takeProfit, stopLoss, tpCandles, slCandles, timeframe,
         connect, disconnect, fetchAccountInfo, fetchSymbols,
         removeFromWatch, addToWatch, subscribeTick, fetchCandles,
         openPosition, openMultiplePositions,
         setAutoTrade, setAutoTradeSymbols, toggleAutoTradeSymbol, toggleAutoTradeExclusion,
-        setLotSize, setAutoTradeLotSize, setTakeProfit, setStopLoss,
+        setLotSize, setAutoTradeLotSize, setExitMode, setTakeProfit, setStopLoss, setTpCandles, setSlCandles,
         setTimeframe, savedCredentials, error,
       }}
     >

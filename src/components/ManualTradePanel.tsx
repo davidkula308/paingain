@@ -15,7 +15,9 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
   const {
     autoTrade, setAutoTrade, lotSize, setLotSize,
     autoTradeLotSize, setAutoTradeLotSize,
+    exitMode, setExitMode,
     takeProfit, setTakeProfit, stopLoss, setStopLoss,
+    tpCandles, setTpCandles, slCandles, setSlCandles,
     openMultiplePositions, accountInfo, watchList, isConnected,
     autoTradeSymbols, autoTradeExcludedSymbols, toggleAutoTradeSymbol, toggleAutoTradeExclusion,
   } = useMetaApi();
@@ -32,8 +34,10 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
     }
     setIsTrading(true);
     try {
+      const exitTp = exitMode === "candles" ? tpCandles : takeProfit;
+      const exitSl = exitMode === "candles" ? slCandles : stopLoss;
       const results = await openMultiplePositions(
-        currentSymbol, type, lotSize, numTrades, takeProfit, stopLoss
+        currentSymbol, type, lotSize, numTrades, exitTp, exitSl
       );
       const succeeded = results.filter((r) => r.success).length;
       const failed = results.filter((r) => !r.success);
@@ -86,6 +90,9 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
           </div>
           <p className="text-[10px] text-muted-foreground">
             Opens trades with this lot until margin is full
+          </p>
+          <p className="text-[10px] text-muted-foreground">
+            Auto-trade uses the same exit mode and values configured below
           </p>
           <p className="text-[10px] text-muted-foreground font-semibold">Auto-Trade Symbols</p>
           <div className="space-y-1 max-h-32 overflow-auto">
@@ -151,37 +158,85 @@ const ManualTradePanel = ({ selectedSymbol }: ManualTradePanelProps) => {
         />
       </div>
 
-      {/* TP / SL in pips */}
+      {/* Exit mode */}
+      <div className="space-y-2">
+        <Label className="text-xs text-muted-foreground">Exit Mode</Label>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setExitMode("pips")}
+            className={exitMode === "pips" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}
+          >
+            Pips
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setExitMode("candles")}
+            className={exitMode === "candles" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}
+          >
+            Candles
+          </Button>
+        </div>
+      </div>
+
+      {/* TP / SL settings */}
       <div className="grid grid-cols-2 gap-2">
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">TP (pips)</Label>
+          <Label className="text-xs text-muted-foreground">{exitMode === "candles" ? "TP (candles)" : "TP (pips)"}</Label>
           <Input
             type="number"
-            value={takeProfit || ""}
+            value={exitMode === "candles" ? tpCandles || "" : takeProfit || ""}
             onChange={(e) => {
               const val = e.target.value;
-              setTakeProfit(val === "" ? 0 : Number(val));
+              if (exitMode === "candles") {
+                setTpCandles(val === "" ? 0 : Number(val));
+              } else {
+                setTakeProfit(val === "" ? 0 : Number(val));
+              }
             }}
-            onBlur={() => { if (takeProfit < 0) setTakeProfit(0); }}
-            placeholder="5000"
+            onBlur={() => {
+              if (exitMode === "candles") {
+                if (tpCandles < 0) setTpCandles(0);
+              } else if (takeProfit < 0) {
+                setTakeProfit(0);
+              }
+            }}
+            placeholder={exitMode === "candles" ? "3" : "5000"}
             className="bg-muted font-mono text-sm h-8"
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">SL (pips)</Label>
+          <Label className="text-xs text-muted-foreground">{exitMode === "candles" ? "SL (candles)" : "SL (pips)"}</Label>
           <Input
             type="number"
-            value={stopLoss || ""}
+            value={exitMode === "candles" ? slCandles || "" : stopLoss || ""}
             onChange={(e) => {
               const val = e.target.value;
-              setStopLoss(val === "" ? 0 : Number(val));
+              if (exitMode === "candles") {
+                setSlCandles(val === "" ? 0 : Number(val));
+              } else {
+                setStopLoss(val === "" ? 0 : Number(val));
+              }
             }}
-            onBlur={() => { if (stopLoss < 0) setStopLoss(0); }}
-            placeholder="8000"
+            onBlur={() => {
+              if (exitMode === "candles") {
+                if (slCandles < 0) setSlCandles(0);
+              } else if (stopLoss < 0) {
+                setStopLoss(0);
+              }
+            }}
+            placeholder={exitMode === "candles" ? "1" : "8000"}
             className="bg-muted font-mono text-sm h-8"
           />
         </div>
       </div>
+      {exitMode === "candles" && (
+        <p className="text-[10px] text-muted-foreground">
+          Candle exits close immediately after the selected candle count closes; set 0 to disable either side
+        </p>
+      )}
 
       {/* Number of Trades */}
       <div className="space-y-1">

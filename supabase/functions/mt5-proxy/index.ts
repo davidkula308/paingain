@@ -224,6 +224,20 @@ async function applyStopsToOpenedOrder(
   return parseApiResponse(response);
 }
 
+async function getQuote(connectionId: string, symbol: string): Promise<{ bid?: number; ask?: number }> {
+  const response = await fetchWithRetry(
+    `${MT5_API_URL}/GetQuote?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}`,
+    { method: "GET" },
+    DEFAULT_REQUEST_TIMEOUT_MS
+  );
+
+  const payload = asRecord(await parseApiResponse(response)) ?? {};
+  return {
+    bid: toFiniteNumber(payload.bid ?? payload.Bid),
+    ask: toFiniteNumber(payload.ask ?? payload.Ask),
+  };
+}
+
 async function waitForOpenedOrder(
   connectionId: string,
   symbol: string,
@@ -376,6 +390,19 @@ serve(async (req) => {
       });
     }
 
+    if (action === "symbolParams") {
+      const { connectionId, symbol } = body;
+      const response = await fetchWithRetry(
+        `${MT5_API_URL}/SymbolParams?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}`,
+        { method: "GET" },
+        DEFAULT_REQUEST_TIMEOUT_MS
+      );
+      const data = await parseApiResponse(response);
+      return new Response(JSON.stringify(data), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     // CANDLES / PRICE HISTORY
     if (action === "candles") {
       const { connectionId, symbol, timeframe } = body;
@@ -391,7 +418,7 @@ serve(async (req) => {
 
     // TRADE
     if (action === "trade") {
-      const { connectionId, symbol, type, volume, tp, sl } = body;
+      const { connectionId, symbol, type, volume, tp, sl, price, slippage } = body;
       const numericVolume = Number(volume);
       if (!Number.isFinite(numericVolume) || numericVolume <= 0) {
         return new Response(JSON.stringify({ error: "Invalid trade volume" }), {
@@ -403,11 +430,19 @@ serve(async (req) => {
       const operation = String(type).toLowerCase() === "sell" ? "Sell" : "Buy";
       const tpNum = Number(tp);
       const slNum = Number(sl);
+      const priceNum = Number(price);
+      const slippageNum = Number(slippage);
       const hasStops = (Number.isFinite(tpNum) && tpNum > 0) || (Number.isFinite(slNum) && slNum > 0);
       const requestedAt = Date.now();
 
       const sendOrder = async () => {
         let url = `${MT5_API_URL}/OrderSendSafe?id=${encodeURIComponent(connectionId)}&symbol=${encodeURIComponent(symbol)}&operation=${encodeURIComponent(operation)}&volume=${encodeURIComponent(String(numericVolume))}`;
+        if (Number.isFinite(priceNum) && priceNum > 0) {
+          url += `&price=${encodeURIComponent(String(priceNum))}`;
+        }
+        if (Number.isFinite(slippageNum) && slippageNum >= 0) {
+          url += `&slippage=${encodeURIComponent(String(Math.round(slippageNum)))}`;
+        }
         if (Number.isFinite(slNum) && slNum > 0) {
           url += `&stoploss=${encodeURIComponent(String(slNum))}`;
         }
@@ -498,6 +533,47 @@ serve(async (req) => {
       }
 
       return new Response(JSON.stringify(responsePayload), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (action === "closeOrder") {
+      const { connectionId, ticket, lots, price, symbol, type, slippage, comment } = body;
+      const ticketNum = Number(ticket);
+      if (!Number.isFinite(ticketNum) || ticketNum <= 0) {
+        return new Response(JSON.stringify({ error: "Invalid ticket" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const lotsNum = Number(lots);
+      const slippageNum = Number(slippage);
+      let closePrice = Number(price);
+
+      if ((!Number.isFinite(closePrice) || closePrice <= 0) && symbol && type) {
+        const quote = await getQuote(connectionId, String(symbol));
+        closePrice = String(type).toLowerCase() === "buy" ? Number(quote.bid) : Number(quote.ask);
+      }
+
+      let url = `${MT5_API_URL}/OrderCloseSafe?id=${encodeURIComponent(connectionId)}&ticket=${encodeURIComponent(String(ticketNum))}`;
+      if (Number.isFinite(lotsNum) && lotsNum > 0) {
+        url += `&lots=${encodeURIComponent(String(lotsNum))}`;
+      }
+      if (Number.isFinite(closePrice) && closePrice > 0) {
+        url += `&price=${encodeURIComponent(String(closePrice))}`;
+      }
+      if (Number.isFinite(slippageNum) && slippageNum >= 0) {
+        url += `&slippage=${encodeURIComponent(String(Math.round(slippageNum)))}`;
+      }
+      if (typeof comment === "string" && comment.trim()) {
+        url += `&comment=${encodeURIComponent(comment.trim())}`;
+      }
+
+      console.log("Close URL:", url);
+      const response = await fetchWithRetry(url, { method: "GET" }, DEFAULT_REQUEST_TIMEOUT_MS);
+      const data = await parseApiResponse(response);
+      return new Response(JSON.stringify(data), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
